@@ -1,0 +1,236 @@
+import { Request, Response, NextFunction } from 'express';
+import bcrypt from 'bcryptjs';
+import User from '@/infrastructure/database/models/User';
+import { JwtService } from '@/infrastructure/auth/jwtService';
+import logger from '@/infrastructure/log/logger';
+import cacheService from '@/infrastructure/caching/redisClient';
+import { SocialLoginUseCase } from '@/usecases/auth/socialLoginUseCase';
+import { GoogleProvider, GitHubProvider } from '@/infrastructure/auth/socialAuthService';
+import { UserRepository } from '@/infrastructure/repositories/UserRepository';
+import { HTTP_STATUS } from '@/utils/httpCodes';
+
+export class AuthController {
+  async login(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { email, password } = req.body;
+      const user = await User.findOne({ where: { email } });
+      if (!user) {
+        return res.status(HTTP_STATUS.UNAUTHORIZED).json({ message: 'Invalid credentials' });
+      }
+
+      const isPasswordValid = await bcrypt.compare(password, user.password!);
+      if (!isPasswordValid) {
+        return res.status(HTTP_STATUS.UNAUTHORIZED).json({ message: 'Invalid credentials' });
+      }
+
+      const userId = String(user.id || ((user as unknown) as { _id?: string | number })._id);
+      
+      const refreshToken = JwtService.generateRefreshToken({ id: userId, email: user.email });
+      const refreshJti = JwtService.decodeToken(refreshToken)?.jti;
+      const accessToken = JwtService.generateToken({ id: userId, email: user.email, sid: refreshJti });
+      
+      // Store refresh token
+      const cacheKey = `refresh_tokens:${userId}`;
+      const activeTokens = await cacheService.get<string[]>(cacheKey) || [];
+      activeTokens.push(refreshJti!);
+      await cacheService.set(cacheKey, activeTokens, 7 * 24 * 60 * 60); // 7 days
+
+      res.json({ token: accessToken, accessToken, refreshToken });
+    } catch (error) {
+      logger.error('Login error:', error);
+      next(error);
+    }
+  }
+
+  async refresh(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { refreshToken } = req.body;
+      if (!refreshToken) {
+        return res.status(HTTP_STATUS.BAD_REQUEST).json({ message: 'Refresh token is required' });
+      }
+
+      const decoded = JwtService.verifyRefreshToken(refreshToken);
+      if (!decoded || !decoded.id || !decoded.jti) {
+        return res.status(HTTP_STATUS.UNAUTHORIZED).json({ message: 'Invalid refresh token' });
+      }
+
+      const userId = String(decoded.id);
+      const incomingJti = decoded.jti;
+
+      const cacheKey = `refresh_tokens:${userId}`;
+      let activeTokens = await cacheService.get<string[]>(cacheKey) || [];
+      
+      if (!activeTokens.includes(incomingJti)) {
+        // Theft detection! Revoke all sessions
+        logger.warn(`Token theft detected for user ${userId}. Revoking all sessions.`);
+        await cacheService.del(cacheKey);
+        return res.status(HTTP_STATUS.UNAUTHORIZED).json({ message: 'Invalid session' });
+      }
+
+      // Valid rotation
+      activeTokens = activeTokens.filter(t => t !== incomingJti);
+      const newRefreshToken = JwtService.generateRefreshToken({ id: userId, email: decoded.email });
+      const newRefreshJti = JwtService.decodeToken(newRefreshToken)?.jti;
+      const newAccessToken = JwtService.generateToken({ id: userId, email: decoded.email, sid: newRefreshJti });
+      
+      activeTokens.push(newRefreshJti!);
+      await cacheService.set(cacheKey, activeTokens, 7 * 24 * 60 * 60);
+      res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
+    } catch (error) {
+      logger.error('Refresh token error:', error);
+      next(error);
+    }
+  }
+
+  async logout(req: Request, res: Response, next: NextFunction) {
+    try {
+      const authHeader = req.headers.authorization;
+      if (!authHeader) {
+        return res.status(HTTP_STATUS.BAD_REQUEST).json({ message: 'No token provided' });
+      }
+
+      const accessTokenStr = authHeader.split(' ')[1];
+      const decodedAccess = JwtService.decodeToken(accessTokenStr);
+      
+      if (decodedAccess && decodedAccess.jti && decodedAccess.exp) {
+        const remainingTime = Math.max(0, decodedAccess.exp - Math.floor(Date.now() / 1000));
+        if (remainingTime > 0) {
+            await cacheService.set(`blacklist:${decodedAccess.jti}`, true, remainingTime);
+        }
+      }
+
+      const { refreshToken } = req.body;
+      if (refreshToken) {
+        const decodedRefresh = JwtService.decodeToken(refreshToken);
+        if (decodedRefresh && decodedRefresh.id && decodedRefresh.jti) {
+           const userId = String(decodedRefresh.id);
+           const cacheKey = `refresh_tokens:${userId}`;
+           let activeTokens = await cacheService.get<string[]>(cacheKey) || [];
+           activeTokens = activeTokens.filter(t => t !== decodedRefresh.jti);
+           await cacheService.set(cacheKey, activeTokens, 7 * 24 * 60 * 60);
+        }
+      }
+
+      res.json({ message: 'Logged out successfully' });
+    } catch (error) {
+      logger.error('Logout error:', error);
+      next(error);
+    }
+  }
+
+  async socialExchange(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { code, provider, redirectUri } = req.body;
+      if (!code || !provider) {
+        return res.status(HTTP_STATUS.BAD_REQUEST).json({ message: 'Code and provider are required' });
+      }
+
+      if (!['Google', 'GitHub'].includes(provider)) {
+        return res.status(HTTP_STATUS.BAD_REQUEST).json({ message: 'Invalid social provider' });
+      }
+
+            let useCase;
+      const userRepository = new UserRepository();
+      if (provider === 'Google') useCase = new SocialLoginUseCase(new GoogleProvider(), userRepository);
+      if (provider === 'GitHub') useCase = new SocialLoginUseCase(new GitHubProvider(), userRepository);
+
+      if (!useCase) {
+        return res.status(HTTP_STATUS.BAD_REQUEST).json({ message: 'Invalid social provider' });
+      }
+
+      const { user, accessToken, refreshToken } = await useCase.execute(code, redirectUri);
+      const userId = String(user.id || ((user as unknown) as { _id?: string | number })._id);
+      const refreshJti = JwtService.decodeToken(refreshToken)?.jti;
+
+      // Store refresh token
+      const cacheKey = `refresh_tokens:${userId}`;
+      const activeTokens = await cacheService.get<string[]>(cacheKey) || [];
+      activeTokens.push(refreshJti!);
+      await cacheService.set(cacheKey, activeTokens, 7 * 24 * 60 * 60);
+
+      res.json({ token: accessToken, accessToken, refreshToken });
+          } catch (error) {
+      logger.error('Social exchange error:', error);
+      next(error);
+    }
+  }
+
+  async googleLogin(req: Request, res: Response) {
+    const rootUrl = 'https://accounts.google.com/o/oauth2/v2/auth';
+    const options = {
+      redirect_uri: process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3000/api/auth/google/callback',
+      client_id: process.env.GOOGLE_CLIENT_ID!,
+      access_type: 'offline',
+      response_type: 'code',
+      prompt: 'consent',
+      scope: [
+        'https://www.googleapis.com/auth/userinfo.profile',
+        'https://www.googleapis.com/auth/userinfo.email',
+      ].join(' '),
+      state: 'google'
+    };
+    const qs = new URLSearchParams(options);
+    res.redirect(`${rootUrl}?${qs.toString()}`);
+  }
+
+  async googleCallback(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { code } = req.query;
+      const redirectUri = process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3000/api/auth/google/callback';
+
+      const useCase = new SocialLoginUseCase(new GoogleProvider(), new UserRepository());
+      const { user, accessToken, refreshToken } = await useCase.execute(code as string, redirectUri);
+      const userId = String(user.id || ((user as unknown) as { _id?: string | number })._id);
+      const refreshJti = JwtService.decodeToken(refreshToken)?.jti;
+
+      // Store refresh token
+      const cacheKey = `refresh_tokens:${userId}`;
+      const activeTokens = await cacheService.get<string[]>(cacheKey) || [];
+      activeTokens.push(refreshJti!);
+      await cacheService.set(cacheKey, activeTokens, 7 * 24 * 60 * 60);
+
+      res.cookie('accessToken', accessToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax' });
+      res.cookie('refreshToken', refreshToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax' });
+      res.redirect('/');
+    } catch (error) {
+      logger.error('Google callback error:', error);
+      res.redirect('/login?error=social_auth_failed');
+    }
+  }
+
+  async githubLogin(req: Request, res: Response) {
+    const rootUrl = 'https://github.com/login/oauth/authorize';
+    const options = {
+      client_id: process.env.GITHUB_CLIENT_ID!,
+      redirect_uri: process.env.GITHUB_CALLBACK_URL || 'http://localhost:3000/api/auth/github/callback',
+      scope: 'user:email',
+      state: 'github'
+    };
+    const qs = new URLSearchParams(options);
+    res.redirect(`${rootUrl}?${qs.toString()}`);
+  }
+
+  async githubCallback(req: Request, res: Response, next: NextFunction) {
+    try {
+      const { code } = req.query;
+
+      const useCase = new SocialLoginUseCase(new GitHubProvider(), new UserRepository());
+      const { user, accessToken, refreshToken } = await useCase.execute(code as string);
+      const userId = String(user.id || ((user as unknown) as { _id?: string | number })._id);
+      const refreshJti = JwtService.decodeToken(refreshToken)?.jti;
+
+      // Store refresh token
+      const cacheKey = `refresh_tokens:${userId}`;
+      const activeTokens = await cacheService.get<string[]>(cacheKey) || [];
+      activeTokens.push(refreshJti!);
+      await cacheService.set(cacheKey, activeTokens, 7 * 24 * 60 * 60);
+
+      res.cookie('accessToken', accessToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax' });
+      res.cookie('refreshToken', refreshToken, { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'lax' });
+      res.redirect('/');
+    } catch (error) {
+      logger.error('GitHub callback error:', error);
+      res.redirect('/login?error=social_auth_failed');
+    }
+  }
+}

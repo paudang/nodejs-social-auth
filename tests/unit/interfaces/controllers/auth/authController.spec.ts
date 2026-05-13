@@ -40,12 +40,14 @@ describe('AuthController', () => {
     mockRequest = {
       body: {},
       headers: {},
-      query: {}
+      query: {},
+      cookies: {}
     };
     mockResponse = {
       status: jest.fn().mockReturnThis(),
       json: jest.fn(),
       cookie: jest.fn(),
+      clearCookie: jest.fn(),
       redirect: jest.fn()
     };
     jest.clearAllMocks();
@@ -274,7 +276,8 @@ describe('AuthController', () => {
 
     
     it('googleCallback should handle Google callback', async () => {
-      mockRequest.query = { code: 'test-code' };
+      mockRequest.query = { code: 'test-code', state: 'test-state' };
+      mockRequest.cookies = { oauth_state: 'test-state' };
       const user = { id: 1, email: 'google@test.com' };
       const mockUseCaseInstance = { execute: jest.fn().mockResolvedValue({ user, accessToken: 'at', refreshToken: 'rt' }) };
       (SocialLoginUseCase as jest.Mock).mockImplementation(() => mockUseCaseInstance);
@@ -285,13 +288,21 @@ describe('AuthController', () => {
       expect(mockResponse.redirect).toHaveBeenCalledWith('/');
     });
 
+    it('googleCallback should return 403 if state is invalid', async () => {
+      mockRequest.query = { code: 'test-code', state: 'invalid-state' };
+      mockRequest.cookies = { oauth_state: 'valid-state' };
+      await authController.googleCallback(mockRequest as Request, mockResponse as Response, nextFunction);
+      expect(mockResponse.status).toHaveBeenCalledWith(HTTP_STATUS.FORBIDDEN);
+    });
+
     it('googleCallback should create user if not exists (MVC)', async () => {
       
     });
 
     it('googleCallback should redirect to login on error', async () => {
       const error = new Error('Callback failed');
-      mockRequest.query = { code: 'code' };
+      mockRequest.query = { code: 'code', state: 'test-state' };
+      mockRequest.cookies = { oauth_state: 'test-state' };
       
       (SocialLoginUseCase as jest.Mock).mockImplementation(() => { throw error; });
       
@@ -303,7 +314,8 @@ describe('AuthController', () => {
 
     
     it('githubCallback should handle GitHub callback', async () => {
-      mockRequest.query = { code: 'test-code' };
+      mockRequest.query = { code: 'test-code', state: 'test-state' };
+      mockRequest.cookies = { oauth_state: 'test-state' };
       const user = { id: 1, email: 'github@test.com' };
       const mockUseCaseInstance = { execute: jest.fn().mockResolvedValue({ user, accessToken: 'at', refreshToken: 'rt' }) };
       (SocialLoginUseCase as jest.Mock).mockImplementation(() => mockUseCaseInstance);
@@ -314,13 +326,21 @@ describe('AuthController', () => {
       expect(mockResponse.redirect).toHaveBeenCalledWith('/');
     });
 
+    it('githubCallback should return 403 if state is invalid', async () => {
+      mockRequest.query = { code: 'test-code', state: 'invalid-state' };
+      mockRequest.cookies = { oauth_state: 'valid-state' };
+      await authController.githubCallback(mockRequest as Request, mockResponse as Response, nextFunction);
+      expect(mockResponse.status).toHaveBeenCalledWith(HTTP_STATUS.FORBIDDEN);
+    });
+
     it('githubCallback should create user if not exists (MVC)', async () => {
       
     });
 
     it('githubCallback should redirect to login on error', async () => {
       const error = new Error('Callback failed');
-      mockRequest.query = { code: 'code' };
+      mockRequest.query = { code: 'code', state: 'test-state' };
+      mockRequest.cookies = { oauth_state: 'test-state' };
       
       (SocialLoginUseCase as jest.Mock).mockImplementation(() => { throw error; });
       

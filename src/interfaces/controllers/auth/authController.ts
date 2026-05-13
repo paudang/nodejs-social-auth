@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import User from '@/infrastructure/database/models/User';
 import { JwtService } from '@/infrastructure/auth/jwtService';
 import logger from '@/infrastructure/log/logger';
@@ -10,6 +11,15 @@ import { UserRepository } from '@/infrastructure/repositories/UserRepository';
 import { HTTP_STATUS } from '@/utils/httpCodes';
 
 export class AuthController {
+  private setOAuthStateCookie(res: Response, state: string) {
+    res.cookie('oauth_state', state, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 10 * 60 * 1000
+    });
+  }
+
   async login(req: Request, res: Response, next: NextFunction) {
     try {
       const { email, password } = req.body;
@@ -129,7 +139,7 @@ export class AuthController {
         return res.status(HTTP_STATUS.BAD_REQUEST).json({ message: 'Invalid social provider' });
       }
 
-            let useCase;
+            let useCase: SocialLoginUseCase | undefined;
       const userRepository = new UserRepository();
       if (provider === 'Google') useCase = new SocialLoginUseCase(new GoogleProvider(), userRepository);
       if (provider === 'GitHub') useCase = new SocialLoginUseCase(new GitHubProvider(), userRepository);
@@ -157,6 +167,9 @@ export class AuthController {
 
   async googleLogin(req: Request, res: Response) {
     const rootUrl = 'https://accounts.google.com/o/oauth2/v2/auth';
+    const state = crypto.randomBytes(16).toString('hex');
+    this.setOAuthStateCookie(res, state);
+
     const options = {
       redirect_uri: process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3000/api/auth/google/callback',
       client_id: process.env.GOOGLE_CLIENT_ID!,
@@ -167,7 +180,7 @@ export class AuthController {
         'https://www.googleapis.com/auth/userinfo.profile',
         'https://www.googleapis.com/auth/userinfo.email',
       ].join(' '),
-      state: 'google'
+      state: state
     };
     const qs = new URLSearchParams(options);
     res.redirect(`${rootUrl}?${qs.toString()}`);
@@ -175,7 +188,14 @@ export class AuthController {
 
   async googleCallback(req: Request, res: Response, next: NextFunction) {
     try {
-      const { code } = req.query;
+      const { code, state } = req.query;
+      const savedState = req.cookies?.oauth_state;
+      res.clearCookie('oauth_state');
+
+      if (!state || state !== savedState) {
+        return res.status(HTTP_STATUS.FORBIDDEN).json({ message: 'Invalid state parameter' });
+      }
+
       const redirectUri = process.env.GOOGLE_CALLBACK_URL || 'http://localhost:3000/api/auth/google/callback';
 
       const useCase = new SocialLoginUseCase(new GoogleProvider(), new UserRepository());
@@ -200,11 +220,14 @@ export class AuthController {
 
   async githubLogin(req: Request, res: Response) {
     const rootUrl = 'https://github.com/login/oauth/authorize';
+    const state = crypto.randomBytes(16).toString('hex');
+    this.setOAuthStateCookie(res, state);
+
     const options = {
       client_id: process.env.GITHUB_CLIENT_ID!,
       redirect_uri: process.env.GITHUB_CALLBACK_URL || 'http://localhost:3000/api/auth/github/callback',
       scope: 'user:email',
-      state: 'github'
+      state: state
     };
     const qs = new URLSearchParams(options);
     res.redirect(`${rootUrl}?${qs.toString()}`);
@@ -212,7 +235,13 @@ export class AuthController {
 
   async githubCallback(req: Request, res: Response, next: NextFunction) {
     try {
-      const { code } = req.query;
+      const { code, state } = req.query;
+      const savedState = req.cookies?.oauth_state;
+      res.clearCookie('oauth_state');
+
+      if (!state || state !== savedState) {
+        return res.status(HTTP_STATUS.FORBIDDEN).json({ message: 'Invalid state parameter' });
+      }
 
       const useCase = new SocialLoginUseCase(new GitHubProvider(), new UserRepository());
       const { user, accessToken, refreshToken } = await useCase.execute(code as string);
